@@ -44,12 +44,15 @@ from ansible_collections.cisco.nd.plugins.module_utils.models.l3out.l3out import
 from ansible_collections.cisco.nd.plugins.module_utils.orchestrators.base import (
     NDBaseOrchestrator,
 )
+from ansible_collections.cisco.nd.plugins.module_utils.orchestrators.config_actions_mixin import (
+    ConfigActionsMixin,
+)
 from ansible_collections.cisco.nd.plugins.module_utils.orchestrators.types import (
     ResponseType,
 )
 
 
-class L3OutOrchestrator(NDBaseOrchestrator[L3OutModel]):
+class L3OutOrchestrator(ConfigActionsMixin, NDBaseOrchestrator[L3OutModel]):
     """
     Orchestrator for L3Out operations on Nexus Dashboard.
 
@@ -62,6 +65,8 @@ class L3OutOrchestrator(NDBaseOrchestrator[L3OutModel]):
     - Overrides query_all() to filter by fabric via query parameter
     - Provides attach_l3outs() for deploy/undeploy operations
     - Resolves switch management IPs to serial numbers via FabricContext
+    - Composes ``ConfigActionsMixin`` for the post-attach "recalculate & deploy"
+      step. L3Out requires no ``config_save`` step -- deploy alone is sufficient.
     """
 
     model_class: ClassVar[Type[NDBaseModel]] = L3OutModel
@@ -158,6 +163,105 @@ class L3OutOrchestrator(NDBaseOrchestrator[L3OutModel]):
                 link.switch1_details.switch_id = self._resolve_switch_id(fabric1, link.switch1_details.switch_id)
             if link.switch2_details and self._is_ip_address(link.switch2_details.switch_id):
                 link.switch2_details.switch_id = self._resolve_switch_id(fabric2, link.switch2_details.switch_id)
+
+    # -------------------------------------------------------------------------
+    # config_actions -- deploy scope resolution
+    # -------------------------------------------------------------------------
+
+    def _resolve_deploy_switch_ids(self, model_instance: L3OutModel) -> Dict[str, List[str]]:
+        """
+        Return ``{fabric_name: [switch_id, ...]}`` for ``config_actions``
+        ``type: switch`` scope, derived from this L3Out's own configuration.
+
+        For ``type: switch``, deploy targets every switch referenced across
+        the L3Out's links (``switch1_details``/``switch2_details``), scoped
+        per fabric. 
+        Only fabrics selected by ``configured_fabrics`` (``fabric1``,
+        ``fabric2``, or ``both``) are included. 
+        Each fabric must be deployed independently.
+
+        Returns an empty dict when there is no ``connectivity_details`` /
+        ``links`` to derive switches from (e.g. an identifier-only item for
+        ``state=deleted``).
+        """
+        result: Dict[str, List[str]] = {}
+        conn = model_instance.connectivity_details
+        if not conn or not conn.links:
+            return result
+
+        configured_fabrics = model_instance.configured_fabrics or "both"
+        include_fabric1 = configured_fabrics in ("both", "fabric1")
+        include_fabric2 = configured_fabrics in ("both", "fabric2")
+
+        fabric1 = model_instance.fabric1_name or self.fabric_name
+        fabric2 = model_instance.fabric2_name or self.fabric_name
+
+        for link in conn.links:
+            if include_fabric1 and link.switch1_details:
+                seen = result.setdefault(fabric1, [])
+                if link.switch1_details.switch_id not in seen:
+                    seen.append(link.switch1_details.switch_id)
+            if include_fabric2 and link.switch2_details:
+                seen = result.setdefault(fabric2, [])
+                if link.switch2_details.switch_id not in seen:
+                    seen.append(link.switch2_details.switch_id)
+
+        return result
+
+    def deploy_config_actions(self, model_instance: L3OutModel, deploy_type: str = "global") -> Dict[str, ResponseType]:
+        """
+        Deploy this L3Out's staged (``pending``) configuration to the switches.
+
+        No ``config_save`` step is performed or required. Deploy successfully 
+        pushed ``attach``-staged config from ``pending`` to ``inSync`` with no prior save call.
+
+        Args:
+            model_instance: The L3Out whose fabrics/switches to deploy.
+            deploy_type: ``"global"`` to recalculate & deploy the entire
+                fabric (all pending switches, not just this L3Out's own), or
+                ``"switch"`` to deploy only the switches this L3Out's own
+                links reference (see ``_resolve_deploy_switch_ids``).
+
+        Returns:
+            ``{fabric_name: deploy_response}`` for every fabric selected by
+            ``configured_fabrics`` -- each fabric is deployed independently
+            (live-verified: a fabric1 deploy does not affect fabric2's
+            pending switches, and vice versa). Fabrics with nothing to deploy
+            (``type: switch`` with no resolved switches) are omitted.
+
+        Raises:
+            ValueError: If deploy_type is not "global" or "switch".
+            Exception: If any per-fabric deploy request fails.
+        """
+        if deploy_type not in ("global", "switch"):
+            raise ValueError(f"Invalid deploy_type '{deploy_type}'. Must be 'global' or 'switch'.")
+
+        results: Dict[str, ResponseType] = {}
+
+        if deploy_type == "switch":
+            switch_map = self._resolve_deploy_switch_ids(model_instance)
+            for fabric_name, switch_ids in switch_map.items():
+                if not switch_ids:
+                    continue
+                # Pass the L3Out's own switches as a pre-fetched ``switches``
+                # list so ConfigActionsMixin.config_deploy skips fabric-wide
+                # switch discovery and deploys exactly these switches. No
+                # ``configSyncStatus`` is supplied: the mixin's deploy filter
+                # treats an unset status as "needs deploy", which is correct
+                # for switches this L3Out just staged via ``attach``.
+                switches = [{"serialNumber": switch_id} for switch_id in switch_ids]
+                results[fabric_name] = self.config_deploy(fabric_name, deploy_type="switch", switches=switches)
+            return results
+
+        # deploy_type == "global": one deploy call per fabric selected by configured_fabrics.
+        configured_fabrics = model_instance.configured_fabrics or "both"
+        fabric1 = model_instance.fabric1_name or self.fabric_name
+        fabric2 = model_instance.fabric2_name or self.fabric_name
+        if configured_fabrics in ("both", "fabric1") and fabric1:
+            results[fabric1] = self.config_deploy(fabric1, deploy_type="global")
+        if configured_fabrics in ("both", "fabric2") and fabric2:
+            results[fabric2] = self.config_deploy(fabric2, deploy_type="global")
+        return results
 
     @staticmethod
     def _validate_bulk_response(result: ResponseType, operation: str) -> None:

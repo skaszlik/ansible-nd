@@ -67,6 +67,9 @@ options:
         - When C(false), the L3Out will be detached from the fabrics.
         - When not specified, no attachment action is performed.
         - Only applicable when O(state) is C(merged) or C(replaced).
+        - This option is a placeholder for the per-resource deploy control described in
+          U(https://github.com/CiscoDevNet/ansible-nd/issues/368), and may be renamed once
+          that design is finalized for the whole collection. See the module notes for details.
         type: bool
       fabric1_name:
         description:
@@ -607,6 +610,14 @@ notes:
 - Changing the O(config.routing_details.routing_protocol) of an existing L3Out (for example from C(static) to C(bgp))
   is rejected by Nexus Dashboard with an HTTP 400 error. To switch routing protocol, remove the L3Out and recreate it
   with the desired protocol.
+- This module does not yet use the standard C(config_actions) save/deploy options that most other C(nd_manage_*)
+  modules support (see U(https://github.com/CiscoDevNet/ansible-nd/issues/368) for the collection-wide design). This
+  is intentional, not an oversight, L3Out attach/detach always applies to one L3Out at a time on Nexus Dashboard.
+  There is no fabric-wide save step and no switch-level or global deploy scope for L3Outs, so the usual
+  C(save)/C(deploy)/C(type) options would not mean anything here.
+- The O(config.attach) option is how this module handles attach/detach today. Once the collection agrees on how
+  per-resource deploy control should work (tracked in the issue above), this option may be renamed or moved to match.
+  This note will be updated when that happens.
 """
 
 EXAMPLES = r"""
